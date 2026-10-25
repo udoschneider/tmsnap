@@ -59,16 +59,45 @@ OpenCode database, and iTerm2's scripting interface; it never writes to them.
 
 ## Install
 
+`tmsnap` is a single executable script, so installing it means putting it on
+your `PATH`.
+
+The recommended setup links the checkout into a per-user bin directory. That
+keeps the repository as the source of truth: edits take effect immediately and
+the installed command cannot drift from the checkout.
+
+```sh
+mkdir -p ~/.local/bin
+ln -sf "$PWD/tmsnap" ~/.local/bin/tmsnap
+```
+
+Make sure `~/.local/bin` is on `PATH`. If it is not, add it to your shell
+startup file (`~/.zshrc` for zsh, `~/.bashrc` or `~/.bash_profile` for bash, or
+run `fish_add_path ~/.local/bin` for fish):
+
+```sh
+# zsh / bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Open a new shell and verify the command resolves to the checkout:
+
+```sh
+command -v tmsnap
+# /Users/you/.local/bin/tmsnap
+readlink "$(command -v tmsnap)"
+# /Users/you/Documents/Development/tmsnap/tmsnap
+tmsnap --version
+```
+
+If you prefer a copy over a link, use `install` instead:
+
 ```sh
 install -m 755 tmsnap ~/.local/bin/tmsnap
 ```
 
-Or keep the checkout as the source of truth and link it, so the installed
-command and the repository cannot drift apart:
-
-```sh
-ln -sf "$PWD/tmsnap" ~/.local/bin/tmsnap
-```
+No `sudo` is needed for a directory under `$HOME`. `python3`, `tmux`, and an
+iTerm2 install (optional, for tab support) are the only runtime requirements.
 
 ## Usage
 
