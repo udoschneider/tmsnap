@@ -1,0 +1,840 @@
+#!/usr/bin/env python3
+"""
+tmsnap -- snapshot and restore tmux sessions, including the Claude Code and
+OpenCode sessions running inside their panes.
+
+  tmsnap save [name]            capture the current tmux server
+  tmsnap list                   list stored snapshots
+  tmsnap show [name]            what is in a snapshot (default: latest)
+  tmsnap restore [name]         rebuild it (default: latest)
+  tmsnap prune --keep N         drop old named snapshots
+
+Design notes
+------------
+*   Claude Code writes ~/.claude/sessions/<pid>.json for every running session,
+    keyed by the PID of the `claude` process. The launcher is a direct child of
+    the pane's shell, so walking the process tree gives an exact pane -> session
+    UUID mapping with no hooks and no guessing.
+
+*   OpenCode keeps no such per-process file. We fall back to the TUI tab state
+    (~/.local/state/opencode/latest/tui/tabs.json, keyed by directory) and, when
+    that is ambiguous, to the most recently viewed session in the SQLite DB.
+    Those bindings are marked "heuristic" and can be wrong when two OpenCode
+    TUIs sit in the same directory.
+
+*   On restore, agent panes get their resume command typed *and* submitted.
+    Everything else is typed into the shell but NOT executed, so you get a
+    chance to look at it first.
+
+Nothing in here writes to ~/.claude or the OpenCode database.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+VERSION = 1
+
+STATE_DIR = Path(os.environ.get("TMSNAP_DIR", Path.home() / ".local" / "state" / "tmux-snapshot"))
+CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+OPENCODE_TABS = Path.home() / ".local" / "state" / "opencode" / "latest" / "tui" / "tabs.json"
+OPENCODE_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+
+US = "\x1f"                      # field separator for tmux -F output
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "elvish", "xonsh", "pwsh"}
+
+
+# --------------------------------------------------------------------------- #
+# small helpers
+# --------------------------------------------------------------------------- #
+
+def warn(msg: str) -> None:
+    print(f"tmsnap: {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = 1) -> "None":
+    warn(msg)
+    raise SystemExit(code)
+
+
+def run(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def tmux(*args: str) -> subprocess.CompletedProcess:
+    return run(["tmux", *args])
+
+
+def have_tmux_server() -> bool:
+    return tmux("list-sessions").returncode == 0
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def hostname() -> str:
+    return socket.gethostname().split(".")[0]
+
+
+def slugify(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    if not slug or slug in (".", ".."):
+        die(f"invalid snapshot name: {name!r}")
+    return slug
+
+
+# --------------------------------------------------------------------------- #
+# process table
+# --------------------------------------------------------------------------- #
+
+def proc_table() -> tuple[dict, dict]:
+    """Return (procs_by_pid, children_by_ppid) from a single ps call."""
+    procs: dict[int, dict] = {}
+    children: dict[int, list[int]] = {}
+    out = run(["ps", "-axo", "pid=,ppid=,pgid=,tpgid=,command="]).stdout
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.*)$", line)
+        if not m:
+            continue
+        pid, ppid, pgid, tpgid = (int(m.group(i)) for i in range(1, 5))
+        procs[pid] = {"ppid": ppid, "pgid": pgid, "tpgid": tpgid, "cmd": m.group(5).strip()}
+        children.setdefault(ppid, []).append(pid)
+    return procs, children
+
+
+def walk(pid: int, children: dict) -> list[tuple[int, int]]:
+    """Breadth-first (pid, depth) pairs for pid and all its descendants."""
+    seen: set[int] = set()
+    out: list[tuple[int, int]] = []
+    frontier = [(pid, 0)]
+    while frontier:
+        cur, depth = frontier.pop(0)
+        if cur in seen:
+            continue
+        seen.add(cur)
+        out.append((cur, depth))
+        frontier.extend((c, depth + 1) for c in children.get(cur, []))
+    return out
+
+
+def proc_start_epoch(pid: int) -> float | None:
+    """Approximate process start time from `ps -o etime`.
+
+    Deliberately not `lstart`: that is locale-dependent, and Claude records
+    procStart in UTC while ps prints local time, so the two never compare equal.
+    """
+    out = run(["ps", "-o", "etime=", "-p", str(pid)]).stdout.strip()
+    m = re.match(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$", out)
+    if not m:
+        return None
+    days, hours, minutes, seconds = (int(g or 0) for g in m.groups())
+    return time.time() - (days * 86400 + hours * 3600 + minutes * 60 + seconds)
+
+
+def basename(cmd: str) -> str:
+    first = (shlex.split(cmd) or [""])[0]
+    return os.path.basename(first).lstrip("-")
+
+
+# --------------------------------------------------------------------------- #
+# agent discovery
+# --------------------------------------------------------------------------- #
+
+def find_transcript(session_id: str) -> str | None:
+    """Locate the Claude transcript for a session id, wherever its project is."""
+    if not CLAUDE_PROJECTS_DIR.is_dir():
+        return None
+    for hit in CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"):
+        return str(hit)
+    return None
+
+
+def claude_from_argv(pane_pid: int, procs: dict, children: dict) -> dict | None:
+    """Fallback: read the session UUID straight out of a descendant's argv."""
+    for pid, _ in walk(pane_pid, children):
+        cmd = procs[pid]["cmd"]
+        if "claude" not in cmd:
+            continue
+        for flag in ("--resume", "-r", "--session-id"):
+            parts = shlex.split(cmd)
+            if flag in parts:
+                value = parts[parts.index(flag) + 1] if parts.index(flag) + 1 < len(parts) else ""
+                m = UUID_RE.search(value)
+                if m:
+                    return {"tool": "claude", "session_id": m.group(0), "confidence": "argv"}
+    return None
+
+
+def find_claude(pane_pid: int, procs: dict, children: dict) -> dict | None:
+    """Exact pane -> Claude session mapping via ~/.claude/sessions/<pid>.json."""
+    candidates = []
+    for pid, depth in walk(pane_pid, children):
+        record = CLAUDE_SESSIONS_DIR / f"{pid}.json"
+        if not record.exists():
+            continue
+        try:
+            data = json.loads(record.read_text())
+        except (OSError, ValueError):
+            continue
+        if "claude" not in procs[pid]["cmd"]:
+            continue
+        session_id = data.get("sessionId")
+        if not session_id:
+            continue
+        candidates.append((depth, pid, data, session_id))
+
+    if not candidates:
+        return claude_from_argv(pane_pid, procs, children)
+
+    # An interactive session can have background jobs hanging off it (kind
+    # "bg"). Prefer interactive, then whatever sits closest to the pane.
+    candidates.sort(key=lambda c: (c[2].get("kind") != "interactive", c[0]))
+    depth, pid, data, session_id = candidates[0]
+
+    # Guard against a recycled PID: a stale <pid>.json from an unrelated Claude
+    # would otherwise be attached to whatever now happens to own that PID.
+    started = proc_start_epoch(pid)
+    recorded_start = data.get("startedAt")
+    verified = False
+    if started is not None and isinstance(recorded_start, (int, float)):
+        verified = abs(started - recorded_start / 1000.0) <= 300
+
+    return {
+        "tool": "claude",
+        "session_id": session_id,
+        "pid": pid,
+        "depth": depth,
+        "kind": data.get("kind"),
+        "name": data.get("name"),
+        "version": data.get("version"),
+        "cwd": data.get("cwd"),
+        "argv": shlex.split(procs[pid]["cmd"]),
+        "transcript": find_transcript(session_id),
+        "confidence": "exact" if verified else "exact-unverified",
+    }
+
+
+def db_rows(sql: str, params: list) -> list[dict]:
+    """Read-only query against the OpenCode database. Never writes."""
+    if not OPENCODE_DB.exists():
+        return []
+    try:
+        con = sqlite3.connect(f"file:{OPENCODE_DB.as_posix()}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return []
+    try:
+        con.row_factory = sqlite3.Row
+        return [dict(r) for r in con.execute(sql, params).fetchall()]
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def tabs_cwd_key(tabs: dict, cwd: str) -> str | None:
+    by_cwd = tabs.get("cwd") or {}
+    if cwd in by_cwd:
+        return cwd
+    target = os.path.realpath(cwd)
+    if target in by_cwd:
+        return target
+    for key in by_cwd:
+        try:
+            if os.path.realpath(key) == target:
+                return key
+        except OSError:
+            continue
+    return None
+
+
+def opencode_times(ids: list[str]) -> dict[str, int]:
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    times: dict[str, int] = {}
+    for table, order in (("session_v2", "coalesce(time_viewed,0)"), ("session", "0")):
+        rows = db_rows(
+            f"select id, max({order}, time_updated) as t from {table} where id in ({marks})",
+            list(ids),
+        )
+        for row in rows:
+            times.setdefault(row["id"], 0)
+            times[row["id"]] = max(times[row["id"]], int(row["t"] or 0))
+    return times
+
+
+def opencode_newest_in(cwd: str) -> dict | None:
+    for table, order in (
+        ("session_v2", "coalesce(time_viewed,0) desc, time_updated desc"),
+        ("session", "time_updated desc"),
+    ):
+        rows = db_rows(
+            f"select id, title from {table} "
+            f"where directory = ? and time_archived is null order by {order} limit 1",
+            [cwd],
+        )
+        if rows:
+            return {"session_id": rows[0]["id"], "title": rows[0]["title"]}
+    return None
+
+
+def find_opencode(cwd: str) -> dict | None:
+    """Heuristic pane -> OpenCode session mapping. Two sources, in order:
+    the TUI tab state for this directory, then the freshest session in the DB."""
+    tabs: dict = {}
+    try:
+        tabs = json.loads(OPENCODE_TABS.read_text())
+    except (OSError, ValueError):
+        pass
+
+    key = tabs_cwd_key(tabs, cwd) if tabs else None
+    if key:
+        entries = [t for t in (tabs["cwd"][key].get("tabs") or []) if t.get("sessionID")]
+        if entries:
+            note = None
+            if len(entries) == 1:
+                chosen = entries[0]
+            else:
+                # Several tabs open in this directory: take the one touched last.
+                times = opencode_times([t["sessionID"] for t in entries])
+                chosen = max(entries, key=lambda t: times.get(t["sessionID"], 0))
+                note = f"{len(entries)} open tabs in this directory, picked the most recent"
+            return {
+                "tool": "opencode",
+                "session_id": chosen["sessionID"],
+                "title": chosen.get("title"),
+                "confidence": "heuristic",
+                "ambiguity": note,
+            }
+
+    newest = opencode_newest_in(cwd)
+    if newest:
+        return {
+            "tool": "opencode",
+            "session_id": newest["session_id"],
+            "title": newest["title"],
+            "confidence": "heuristic",
+            "ambiguity": "no TUI tab state for this directory; used the freshest session in the DB",
+        }
+    return None
+
+
+def foreground_command(pane_pid: int, procs: dict, children: dict) -> str | None:
+    """The command line running in the foreground of a shell pane, if any."""
+    shell = procs.get(pane_pid)
+    if not shell:
+        return None
+    tpgid = shell["tpgid"]
+    if tpgid <= 0 or tpgid == shell["pgid"]:
+        return None                                   # shell is sitting at the prompt
+    leader = procs.get(tpgid)
+    if not leader:
+        return None
+    head = basename(leader["cmd"])
+    if head in SHELLS or head in ("claude", "claude.exe", "opencode"):
+        return None
+    return leader["cmd"]
+
+
+def agent_for(pane: dict, procs: dict, children: dict) -> dict | None:
+    r"""Route a pane to the right detector. pane[\"current_command\"] is the cheap
+    pre-filter: tmux already tells us whether an agent owns the foreground."""
+    current = basename(pane["current_command"])
+    pane_pid = pane["pane_pid"]
+
+    if current in ("claude", "claude.exe"):
+        return find_claude(pane_pid, procs, children)
+    if current == "opencode":
+        found = find_opencode(pane["cwd"])
+        if found:
+            return found
+        return {"tool": "opencode", "session_id": None, "confidence": "unknown",
+                "ambiguity": "opencode is running but no session could be identified"}
+
+    # Fallback: the foreground command lies (wrappers, mise shims, ...), so look
+    # for a claude session anywhere under the pane.
+    return find_claude(pane_pid, procs, children)
+
+
+# --------------------------------------------------------------------------- #
+# snapshot
+# --------------------------------------------------------------------------- #
+
+def collect() -> list[dict]:
+    """Read the live tmux server and return a snapshot-ready session list."""
+    windows_out = tmux(
+        "list-windows", "-a", "-F",
+        US.join(["#{session_name}", "#{window_index}", "#{window_name}", "#{window_layout}",
+                 "#{window_active}", "#{window_zoomed_flag}"]),
+    )
+    panes_out = tmux(
+        "list-panes", "-a", "-F",
+        US.join(["#{session_name}", "#{window_index}", "#{pane_index}", "#{pane_id}",
+                 "#{pane_pid}", "#{pane_current_command}", "#{pane_current_path}",
+                 "#{pane_title}", "#{pane_active}", "#{pane_tty}"]),
+    )
+    if windows_out.returncode != 0:
+        die("cannot talk to the tmux server")
+
+    procs, children = proc_table()
+
+    windows: dict[tuple[str, int], dict] = {}
+    for line in windows_out.stdout.splitlines():
+        f = line.split(US)
+        if len(f) < 6:
+            continue
+        key = (f[0], int(f[1]))
+        windows[key] = {
+            "index": int(f[1]),
+            "name": f[2],
+            "layout": f[3],
+            "active": f[4] == "1",
+            "zoomed": f[5] == "1",
+            "panes": [],
+        }
+
+    for line in panes_out.stdout.splitlines():
+        f = line.split(US)
+        if len(f) < 10:
+            continue
+        pane = {
+            "index": int(f[2]),
+            "pane_id": f[3],
+            "pane_pid": int(f[4]),
+            "current_command": f[5],
+            "cwd": f[6],
+            "title": f[7],
+            "active": f[8] == "1",
+            "tty": f[9],
+            "shell": basename(procs.get(int(f[4]), {}).get("cmd", "")) or None,
+            "agent": None,
+            "command": None,
+        }
+        pane["agent"] = agent_for(pane, procs, children)
+        if not pane["agent"]:
+            pane["command"] = foreground_command(pane["pane_pid"], procs, children)
+        windows.setdefault((f[0], int(f[1])), {"index": int(f[1]), "name": "", "layout": "",
+                                              "active": False, "zoomed": False,
+                                              "panes": []})["panes"].append(pane)
+
+    sessions: dict[str, dict] = {}
+    for (session_name, _), window in sorted(windows.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        window["panes"].sort(key=lambda p: p["index"])
+        sessions.setdefault(session_name, {"name": session_name, "attached": False,
+                                          "windows": []})["windows"].append(window)
+
+    for session in sessions.values():
+        session["attached"] = any(w["active"] for w in session["windows"])
+    return list(sessions.values())
+
+
+def build_snapshot() -> dict:
+    if not shutil.which("tmux"):
+        die("tmux not found in PATH")
+    if not have_tmux_server():
+        die("no tmux server running - nothing to snapshot")
+    sessions = collect()
+    if not sessions:
+        die("tmux server has no sessions")
+    return {
+        "version": VERSION,
+        "created": now_iso(),
+        "host": hostname(),
+        "tmux_version": tmux("-V").stdout.strip(),
+        "sessions": sessions,
+    }
+
+
+def snapshot_path(name: str) -> Path:
+    return STATE_DIR / f"{slugify(name)}.json"
+
+
+def load_snapshot(name: str) -> dict:
+    path = snapshot_path(name)
+    if not path.exists():
+        available = ", ".join(s.stem for s in sorted(STATE_DIR.glob("*.json"))) or "none"
+        die(f"no snapshot named {name!r} (have: {available})")
+    try:
+        return json.loads(path.read_text())
+    except ValueError as exc:
+        die(f"snapshot {path} is not valid JSON: {exc}")
+
+
+def write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def agents_in(snapshot: dict) -> list[tuple[str, dict, dict]]:
+    out = []
+    for session in snapshot["sessions"]:
+        for window in session["windows"]:
+            for pane in window["panes"]:
+                if pane.get("agent"):
+                    out.append((session["name"], window, pane))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+
+def cmd_save(args: argparse.Namespace) -> int:
+    snapshot = build_snapshot()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(snapshot, indent=2) + "\n"
+
+    write_atomic(STATE_DIR / "latest.json", payload)
+    written = ["latest"]
+    if args.name:
+        slug = slugify(args.name)
+        if slug == "latest":
+            die("'latest' is reserved")
+        write_atomic(snapshot_path(slug), payload)
+        written.append(slug)
+
+    panes = sum(len(w["panes"]) for s in snapshot["sessions"] for w in s["windows"])
+    agents = agents_in(snapshot)
+    tools: dict[str, int] = {}
+    for _, _, pane in agents:
+        tools[pane["agent"]["tool"]] = tools.get(pane["agent"]["tool"], 0) + 1
+    breakdown = ", ".join(f"{n} {t}" for t, n in sorted(tools.items())) or "none"
+
+    print(f"saved {'+'.join(written)} -> {STATE_DIR}")
+    print(f"  {len(snapshot['sessions'])} sessions, {panes} panes, "
+          f"{len(agents)} agent sessions ({breakdown})")
+    weak = [p for _, _, p in agents if p["agent"]["confidence"] not in ("exact", "exact-unverified")]
+    if weak:
+        print(f"  {len(weak)} binding(s) are heuristic - run 'tmsnap show' for details")
+    stale = [p for _, _, p in agents if p["agent"]["confidence"] == "exact-unverified"]
+    if stale:
+        print(f"  {len(stale)} binding(s) could not be confirmed by process start time")
+    return 0
+
+
+def cmd_list(_: argparse.Namespace) -> int:
+    files = sorted(STATE_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        print("no snapshots yet - run 'tmsnap save'")
+        return 0
+    for path in files:
+        try:
+            snap = json.loads(path.read_text())
+        except (OSError, ValueError):
+            print(f"{path.stem:<28} <unreadable>")
+            continue
+        panes = sum(len(w["panes"]) for s in snap["sessions"] for w in s["windows"])
+        agents = len(agents_in(snap))
+        created = str(snap.get("created", "?"))[:19].replace("T", " ")
+        names = ", ".join(s["name"] for s in snap["sessions"])
+        print(f"{path.stem:<28} {created}  {len(snap['sessions'])} sess  "
+              f"{panes} panes  {agents} agents  [{names}]")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    snap = load_snapshot(args.name)
+    print(f"snapshot {args.name!r}  saved {str(snap.get('created','?'))[:19].replace('T',' ')}  "
+          f"host {snap.get('host','?')}  {snap.get('tmux_version','?')}")
+
+    agents = agents_in(snap)
+    if not agents:
+        print("  no agent sessions recorded")
+
+    for session in snap["sessions"]:
+        windows = session["windows"]
+        panes = sum(len(w["panes"]) for w in windows)
+        flag = " [attached]" if session.get("attached") else ""
+        print(f"\n  session {session['name']}{flag}   ({len(windows)} windows, {panes} panes)")
+        for window in windows:
+            mark = " *" if window["active"] else "  "
+            print(f"  {mark}win {window['index']} \"{window['name']}\""
+                  f"{' [zoomed]' if window['zoomed'] else ''}")
+            for pane in window["panes"]:
+                cursor = ">" if pane["active"] else " "
+                print(f"      {cursor} pane {pane['index']}  {pane['cwd']}")
+                agent = pane.get("agent")
+                if agent:
+                    sid = agent.get("session_id") or "<unidentified>"
+                    label = agent.get("name") or agent.get("title") or ""
+                    trust = {"exact": "exact", "exact-unverified": "exact (start time not confirmed)",
+                             "argv": "from argv", "heuristic": "heuristic",
+                             "unknown": "unknown"}.get(agent.get("confidence"), "?")
+                    print(f"          {agent['tool']:<9} {label}")
+                    print(f"          {sid}")
+                    print(f"          binding: {trust}"
+                          f"{'  pid ' + str(agent['pid']) if agent.get('pid') else ''}")
+                    if agent.get("transcript"):
+                        print(f"          transcript: {agent['transcript']}")
+                    if agent.get("ambiguity"):
+                        print(f"          note: {agent['ambiguity']}")
+                elif pane.get("command"):
+                    print(f"          command (typed, not run): {pane['command']}")
+                else:
+                    print("          empty shell")
+    return 0
+
+
+class Runner:
+    """Executes tmux commands, or just prints them with --dry-run."""
+
+    def __init__(self, dry: bool):
+        self.dry = dry
+
+    def __call__(self, *args: str) -> str:
+        if self.dry:
+            print("    $ tmux " + " ".join(shlex.quote(a) for a in args))
+            return ""
+        result = tmux(*args)
+        if result.returncode != 0:
+            warn(f"tmux {' '.join(args)}: {result.stderr.strip() or 'failed'}")
+        return result.stdout
+
+    def query(self, *args: str) -> str:
+        if self.dry:
+            return ""
+        return tmux(*args).stdout.strip()
+
+
+def has_session(name: str) -> bool:
+    return tmux("has-session", "-t", f"={name}").returncode == 0
+
+
+def wait_for_shell(target: str, shell: str | None, runner: Runner) -> None:
+    """Wait until the pane's shell is up *and* has drawn its first prompt.
+
+    `pane_current_command` alone is not enough: it reports the shell the instant
+    the process starts, while rc files (prompt themes, zoxide, version managers)
+    may still be sourcing. Anything typed then is buffered rather than lost, but
+    waiting for real output means the text lands visibly at the prompt.
+    """
+    if runner.dry:
+        return
+    deadline = time.time() + 6.0
+    wanted = (shell or "").lstrip("-").lower()
+    while time.time() < deadline:
+        current = tmux("display-message", "-p", "-t", target, "#{pane_current_command}").stdout.strip()
+        if current and (not wanted or current.lower() == wanted):
+            if tmux("capture-pane", "-p", "-t", target).stdout.strip():
+                break
+        time.sleep(0.05)
+    time.sleep(0.15)
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    snap = load_snapshot(args.name)
+    runner = Runner(args.dry_run)
+
+    if snap.get("host") and snap["host"] != hostname():
+        warn(f"snapshot was taken on {snap['host']!r}, this host is {hostname()!r}")
+
+    sessions = snap["sessions"]
+    if args.only:
+        wanted = set(args.only)
+        sessions = [s for s in sessions if s["name"] in wanted]
+        missing = wanted - {s["name"] for s in sessions}
+        if missing:
+            die(f"not in this snapshot: {', '.join(sorted(missing))}")
+    if not sessions:
+        die("nothing to restore")
+
+    created = skipped = typed = executed = 0
+    verb = "would create" if args.dry_run else "creating"
+    print(f"{verb} {len(sessions)} session(s) from {args.name!r}"
+          f"{' (dry run)' if args.dry_run else ''}")
+
+    for session in sessions:
+        name = session["name"]
+        windows = session["windows"]
+        if has_session(name):
+            if not args.force:
+                warn(f"session {name!r} already exists - skipping (use --force to replace)")
+                skipped += 1
+                continue
+            runner("kill-session", "-t", name)
+        created += 1
+
+        print(f"\n  {name}")
+        first = windows[0]
+        start_cwd = pane_cwd(first["panes"][0]["cwd"])
+        runner("new-session", "-d", "-s", name, "-c", start_cwd)
+
+        auto = runner.query("display-message", "-p", "-t", f"={name}:", "#{window_index}")
+        auto_index = int(auto) if auto.isdigit() else first["index"]
+        if auto_index != first["index"]:
+            runner("move-window", "-s", f"{name}:{auto_index}", "-t", f"{name}:{first['index']}")
+        runner("rename-window", "-t", f"{name}:{first['index']}", first["name"] or f"win{first['index']}")
+
+        for window in windows[1:]:
+            runner("new-window", "-d", "-t", f"{name}:{window['index']}",
+                   "-n", window["name"] or f"win{window['index']}",
+                   "-c", pane_cwd(window["panes"][0]["cwd"]))
+
+        # Extra panes, then replay the recorded layout so geometry comes back exactly.
+        for window in windows:
+            target_window = f"{name}:{window['index']}"
+            for pane in window["panes"][1:]:
+                runner("split-window", "-d", "-t", target_window, "-c", pane_cwd(pane["cwd"]))
+            if window["layout"] and len(window["panes"]) > 1:
+                runner("select-layout", "-t", target_window, window["layout"])
+            if window["zoomed"] and window["panes"]:
+                active = next((p for p in window["panes"] if p["active"]), window["panes"][0])
+                runner("resize-pane", "-Z", "-t", f"{target_window}.{active['index']}")
+
+        for window in windows:
+            active = next((p for p in window["panes"] if p["active"]), window["panes"][0])
+            runner("select-pane", "-t", f"{name}:{window['index']}.{active['index']}")
+        active_window = next((w for w in windows if w["active"]), windows[0])
+        runner("select-window", "-t", f"{name}:{active_window['index']}")
+
+        # Now the payload: agent resumes, and inert command lines everywhere else.
+        for window in windows:
+            for pane in window["panes"]:
+                target = f"{name}:{window['index']}.{pane['index']}"
+                agent = pane.get("agent")
+                if agent and agent.get("session_id"):
+                    line = resume_command(agent)
+                    wait_for_shell(target, pane.get("shell"), runner)
+                    runner("send-keys", "-t", target, "-l", line)
+                    if args.no_exec:
+                        print(f"    {target}  resume (press Enter): {line}")
+                    else:
+                        runner("send-keys", "-t", target, "Enter")
+                        print(f"    {target}  resuming: {line}")
+                        executed += 1
+                elif pane.get("command"):
+                    wait_for_shell(target, pane.get("shell"), runner)
+                    runner("send-keys", "-t", target, "-l", pane["command"])
+                    print(f"    {target}  typed (not run): {pane['command']}")
+                    typed += 1
+                elif agent:
+                    warn(f"{target}: {agent['tool']} is running but no session id was found")
+
+    print(f"\n{len(sessions)} session(s) in snapshot: {created} created, {skipped} skipped")
+    if typed:
+        print(f"{typed} command(s) typed but not executed - press Enter in those panes when ready")
+    if executed:
+        print(f"{executed} agent session(s) resumed")
+
+    if args.attach and not args.dry_run and created:
+        name = sessions[0]["name"]
+        if os.environ.get("TMUX"):
+            runner("switch-client", "-t", name)
+        else:
+            subprocess.run(["tmux", "attach", "-t", name])
+    return 0
+
+
+def pane_cwd(cwd: str) -> str:
+    """Fall back to $HOME when a recorded directory is gone (unmounted volume,
+    renamed folder, ...) rather than failing the whole restore."""
+    if cwd and os.path.isdir(cwd):
+        return cwd
+    warn(f"directory {cwd!r} no longer exists - using {Path.home()}")
+    return str(Path.home())
+
+
+def resume_command(agent: dict) -> str:
+    sid = agent["session_id"]
+    if agent["tool"] == "claude":
+        argv = agent.get("argv") or []
+        if "--resume" in argv or "-r" in argv or "--continue" in argv or "-c" in argv:
+            return " ".join(shlex.quote(a) for a in argv)      # keep the user's own flags
+        return f"claude --resume {sid}"
+    if agent["tool"] == "opencode":
+        return f"opencode --session {sid}"
+    return f"# unknown agent {agent['tool']}"
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    files = sorted(
+        (p for p in STATE_DIR.glob("*.json") if p.stem != "latest"),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )
+    victims = files[max(args.keep, 0):]
+    if not victims:
+        print(f"nothing to prune ({len(files)} named snapshot(s), keeping {args.keep})")
+        return 0
+    for path in victims:
+        print(f"  {'removing' if args.yes else 'would remove'} {path.name}")
+        if args.yes:
+            path.unlink()
+    if not args.yes and sys.stdin.isatty():
+        if input(f"delete {len(victims)} snapshot(s)? [y/N] ").strip().lower() in ("y", "yes"):
+            for path in victims:
+                path.unlink()
+    elif not args.yes:
+        print("re-run with --yes to delete")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# entry point
+# --------------------------------------------------------------------------- #
+
+def main(argv: list[str] | None = None) -> int:
+    # Keep warnings and progress in order when output is piped or logged.
+    if not sys.stdout.isatty():
+        sys.stdout.reconfigure(line_buffering=True)
+    parser = argparse.ArgumentParser(
+        prog="tmsnap",
+        description="Snapshot tmux sessions together with the Claude/OpenCode sessions in their panes.",
+    )
+    parser.add_argument("--version", action="version", version=f"tmsnap {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_save = sub.add_parser("save", help="capture the current tmux server")
+    p_save.add_argument("name", nargs="?", help="also store under this name")
+    p_save.set_defaults(func=cmd_save)
+
+    p_list = sub.add_parser("list", help="list stored snapshots")
+    p_list.set_defaults(func=cmd_list)
+
+    p_show = sub.add_parser("show", help="show the contents of a snapshot")
+    p_show.add_argument("name", nargs="?", default="latest")
+    p_show.set_defaults(func=cmd_show)
+
+    p_restore = sub.add_parser("restore", help="rebuild a snapshot")
+    p_restore.add_argument("name", nargs="?", default="latest")
+    p_restore.add_argument("--only", action="append", metavar="SESSION",
+                           help="restore only this tmux session (repeatable)")
+    p_restore.add_argument("--force", action="store_true",
+                           help="kill and recreate sessions that already exist")
+    p_restore.add_argument("--no-exec", action="store_true",
+                           help="type agent resume commands but do not submit them")
+    p_restore.add_argument("--dry-run", action="store_true",
+                           help="print what would happen, change nothing")
+    p_restore.add_argument("--attach", action="store_true",
+                           help="attach/switch to the first restored session")
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_prune = sub.add_parser("prune", help="delete old named snapshots")
+    p_prune.add_argument("--keep", type=int, default=10, help="how many to keep (default 10)")
+    p_prune.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    p_prune.set_defaults(func=cmd_prune)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
