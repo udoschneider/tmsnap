@@ -1,7 +1,7 @@
 # tmsnap
 
-Snapshot and restore tmux sessions **together with the Claude Code and OpenCode
-sessions running inside their panes**.
+Snapshot and restore a terminal workspace: **tmux sessions, the iTerm2 tabs
+around them, and the Claude Code / OpenCode sessions inside them.**
 
 `tmux-resurrect` and `tmux-continuum` bring back your shell layout. They do not
 bring back the conversation that was in it. After a reboot you get three panes
@@ -9,7 +9,15 @@ with three shells, and then you go hunting through `claude --resume` pickers
 trying to work out which of the forty listed sessions was in which pane.
 
 `tmsnap` records the binding between a pane and its agent session, so a restore
-puts the right conversation back in the right pane.
+puts the right conversation back in the right pane. When iTerm2 is running, it
+also records which tab is attached to which tmux session, so `--attach` can put
+each session back in its own tab instead of dropping you into the first one.
+
+The name is short for *terminal workspace snapshot*. It started as a tmux-only
+tool (`tm` = tmux), and tmux is still the backbone; iTerm2 tabs and agent
+sessions are the layers around it. The command name and the
+`~/.local/state/tmux-snapshot` directory are unchanged so existing aliases and
+snapshots keep working.
 
 ## What a snapshot contains
 
@@ -19,6 +27,8 @@ puts the right conversation back in the right pane.
   Claude Code session UUID and OpenCode session ID.
 * For panes running anything else, the foreground command line.
 * Working directory, terminal, and the pane's shell for each pane.
+* iTerm2 windows, tabs, splits, profiles and working directories, plus the
+  exact tab -> tmux session binding for tabs that are local tmux clients.
 
 On restore:
 
@@ -26,6 +36,10 @@ On restore:
   **and submitted**, so the conversation comes straight back.
 * All other panes get their command typed **but not executed**. It sits at the
   prompt until you press Enter, so nothing runs before you have looked at it.
+* With `--attach`, the recorded iTerm tabs are recreated. A tab that was a tmux
+  client runs `tmux attach -t <session>`; plain tabs get their working
+  directory back and their command typed (or an agent resumed). Existing tabs
+  that already show the same tmux session are reused instead of duplicated.
 
 ## Requirements
 
@@ -34,11 +48,14 @@ On restore:
 * `python3` (3.9+). Standard library only. No `pip install`, no dependencies.
 * Claude Code and/or OpenCode, obviously, but only for the agent bindings.
   Plain tmux sessions snapshot fine on their own.
+* iTerm2 is optional and only used on macOS. Tab capture and restore go through
+  AppleScript, which ships with macOS. The first run may ask for permission to
+  control iTerm2 (System Settings > Privacy & Security > Automation).
 
-Developed and tested on macOS. Nothing platform-specific is used (`ps` field
-selection and `tmux` format variables behave the same on Linux), but Linux is
-untested. `tmsnap` only reads from `~/.claude` and the OpenCode database; it
-never writes to them.
+Developed and tested on macOS. Nothing platform-specific is required for the
+tmux part (`ps` field selection and `tmux` format variables behave the same on
+Linux), but Linux is untested. `tmsnap` only reads from `~/.claude`, the
+OpenCode database, and iTerm2's scripting interface; it never writes to them.
 
 ## Install
 
@@ -58,6 +75,7 @@ ln -sf "$PWD/tmsnap" ~/.local/bin/tmsnap
 ```sh
 tmsnap save                     # capture the running server -> latest.json
 tmsnap save pre-reboot          # also store a named copy for history
+tmsnap save --no-iterm          # tmux only; skip iTerm2 tab capture
 
 tmsnap list                     # what is stored
 tmsnap show                     # default: latest
@@ -65,12 +83,17 @@ tmsnap show pre-reboot
 
 tmsnap restore                  # default: latest
 tmsnap restore pre-reboot --only Knowledge --attach
+tmsnap restore --attach         # recreate tmux sessions *and* iTerm tabs
 tmsnap restore --dry-run        # print the plan, change nothing
 
 tmsnap prune --keep 10          # drop old named snapshots
 ```
 
 Snapshots live in `~/.local/state/tmux-snapshot/`. Override with `TMSNAP_DIR`.
+
+iTerm capture happens automatically when iTerm2 is running. Snapshots taken
+with `--no-iterm`, while iTerm was closed, or by an older `tmsnap` have no
+iTerm section; `--attach` then falls back to the single-session behaviour.
 
 `latest.json` is rewritten on every save. Named snapshots are not touched by a
 later save, so `tmsnap save <name>` is your history and `tmsnap restore` is
@@ -83,12 +106,17 @@ your one-command recovery.
 | `--only SESSION` | Restore just this tmux session. Repeatable. |
 | `--force` | Kill and recreate sessions that already exist. |
 | `--no-exec` | Type agent resume commands but do not submit them. |
-| `--dry-run` | Print every `tmux` command, execute nothing. |
-| `--attach` | Switch client to the first restored session when done. |
+| `--dry-run` | Print every `tmux` command and iTerm action, execute nothing. |
+| `--attach` | Recreate the recorded iTerm tabs, or switch to the first session if iTerm is unavailable. |
+| `--no-iterm` | Do not recreate iTerm tabs; use the old single-session `--attach` behaviour. |
 
 Sessions that already exist are skipped by default, so a stray `tmsnap restore`
 is not destructive. `--force` is the destructive one: it kills the session
 before recreating it.
+
+With `--only`, iTerm restore is limited to tabs bound to the selected tmux
+sessions; plain tabs (no tmux client) are not recreated. `--attach` without
+`--only` restores every recorded tab.
 
 ### Example
 
@@ -96,6 +124,7 @@ before recreating it.
 $ tmsnap save
 saved latest -> /Users/you/.local/state/tmux-snapshot
   1 sessions, 3 panes, 3 agent sessions (3 claude)
+  1 iTerm window, 3 tabs (1 tmux client)
 
 $ tmsnap show
 snapshot 'latest'  saved 2026-10-16 09:54:56  host workstation  tmux 3.6a
@@ -107,6 +136,20 @@ snapshot 'latest'  saved 2026-10-16 09:54:56  host workstation  tmux 3.6a
           899c0f6b-90a4-4a38-99b9-c40ac9acdc4a
           binding: exact  pid 26984
           transcript: /Users/you/.claude/projects/-Users-you-Documents-Knowledge/899c0f6b-...jsonl
+
+  iTerm 3.7.6   (1 window, 3 tabs, 1 tmux client)
+  window 1 [front]
+    tab 1 "Knowledge"
+      > session 1  /Users/you
+          tmux client -> Knowledge  (attach on restore)
+    tab 2 "notes"
+      > session 1  /Users/you/Documents/Knowledge
+          empty shell
+    tab 3 "OC"
+      > session 1  /Users/you/Documents/Knowledge
+          opencode  knowledge-5b
+          ses_e8d221eecffe6aJjc20mTTChZI
+          binding: heuristic
 ```
 
 ## How agent detection works
@@ -188,10 +231,52 @@ typed into the restored pane. Two consequences: a pipeline records only the
 process group leader, and a shell sitting at a prompt records nothing, which is
 the intended outcome.
 
+### iTerm2 tabs: exact for tmux clients
+
+iTerm2 exposes windows, tabs and sessions (split panes) through AppleScript.
+`tmsnap save` walks that tree and records, for every tab, the profile, the
+working directory (from iTerm's `session.path` variable, with `lsof` as a
+fallback), the foreground command or agent binding, and the cell size of each
+split. Agent detection for a tab reuses the same pane detectors, starting from
+the tab's shell PID and TTY.
+
+The important part is the tab -> tmux binding. `tmux list-clients` reports the
+TTY of every attached client, and that TTY is the same `/dev/ttysNNN` iTerm
+gives the tab. So matching the two is exact; there is no title or command-line
+parsing involved:
+
+```
+iTerm tab /dev/ttys004  --  tmux list-clients  --  session "Knowledge"
+```
+
+On restore, `--attach` creates a tab per recorded tmux client and types
+`tmux attach -t Knowledge` into it. If an existing iTerm tab is already a
+client of that session, it is reused instead of duplicated.
+
+A few limits are worth knowing:
+
+* **Control mode is skipped.** With `tmux -CC`, iTerm's tabs are tmux windows,
+  not clients. `tmsnap` leaves that layout to `tmux -CC attach`.
+* **Hotkey windows are skipped** so a restore does not clone your drop-down
+  terminal.
+* **Split direction is inferred, not read.** AppleScript exposes each pane's
+  size but not the split tree. Equal rows with different columns means side by
+  side; equal columns with different rows means stacked. Unusual nested layouts
+  may come back as a flat row/column of panes. Tab-level layout is exact.
+* **Nothing is typed into a busy shell.** Each new tab is polled until the
+  shell itself is in the foreground. If an rc file, a passphrase prompt, or
+  another startup program still owns the terminal, the tab is created but left
+  alone and a warning is printed, rather than typing into that program.
+
+AppleScript is in maintenance mode in iTerm2. The commands used here
+(`create window/tab`, `split`, `write text`, `select`, `variable`) are stable
+and have existed for years, but if iTerm ever removes them the fallback is
+iTerm's Python API, which would add a dependency.
+
 ## Snapshot format
 
 Plain JSON, versioned, readable and diffable. This is what a fully-featured
-pane entry looks like:
+snapshot looks like:
 
 ```json
 {
@@ -237,12 +322,52 @@ pane entry looks like:
         }
       ]
     }
-  ]
+  ],
+  "iterm": {
+    "version": "3.7.6",
+    "mode": "clients",
+    "windows": [
+      {
+        "id": 306,
+        "index": 1,
+        "name": "work",
+        "bounds": [0, 0, 1920, 1080],
+        "frontmost": true,
+        "hotkey": false,
+        "tabs": [
+          {
+            "index": 1,
+            "title": "Knowledge",
+            "active": true,
+            "split": "vertical",
+            "sessions": [
+              {
+                "index": 1,
+                "id": "A0CCDAAB-0AB7-4BCB-B339-2EEA16580447",
+                "tty": "/dev/ttys004",
+                "name": "Knowledge",
+                "profile": "Default",
+                "cwd": "/Users/you",
+                "pid": 1213,
+                "columns": 272,
+                "rows": 75,
+                "active": true,
+                "tmux": {"session": "Knowledge", "control": false},
+                "agent": null,
+                "command": null
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
 }
 ```
 
-`agent` and `command` are mutually exclusive: a pane has one or the other, or
-neither.
+`agent` and `command` are mutually exclusive: a pane or iTerm session has one
+or the other, or neither. `tmux` on an iTerm session means "this tab is a local
+tmux client for that session"; such a session has no `agent` or `command`.
 
 ## How restore rebuilds the layout
 
@@ -258,6 +383,10 @@ neither.
    `zoxide`, and version managers are still sourcing. Input typed then is
    buffered rather than lost, but it lands invisibly and looks broken.
 4. Agent panes are submitted; everything else is left for you to press Enter.
+5. When `--attach` is used, iTerm tabs are recreated in the current window (or
+   in new windows if the snapshot had several) after the tmux sessions exist.
+   Each new tab is polled the same way before anything is typed. Reused tmux
+   client tabs are only selected, never retyped.
 
 ## Caveats
 
@@ -270,7 +399,20 @@ neither.
   only bites if you restore one session while another is still alive. Claude's
   `--fork-session` is the escape hatch.
 * **OpenCode bindings can be wrong** when two TUIs share a directory. See above.
-* **`--force` kills sessions.** That is the entire point of the flag.
+* **iTerm tab restore only happens with `--attach`**, and only when iTerm is
+  running and scriptable. Without it you get the tmux sessions detached, as
+  before.
+* **An extra empty tab can remain.** Restoring into the current iTerm window
+  appends tabs to whatever is already there, so a fresh window keeps its
+  initial shell tab. Tabs that are already tmux clients for a recorded session
+  are reused, but plain/agent tabs are recreated. To avoid duplicates entirely,
+  restore in a new window.
+* **iTerm control mode is out of scope.** If any local tmux client is running
+  with `-CC`, iTerm tabs are not snapshotted; use `tmux -CC attach` for that
+  layout.
+* **`--force` kills sessions.** That is the entire point of the flag. It also
+  detaches any iTerm tab that was displaying the killed session, so the tab
+  drops to a shell and a new tab is created for the restored session.
 
 ## Roadmap
 
@@ -280,8 +422,11 @@ neither.
 * `set-hook -g client-detached 'run-shell "tmsnap save"'` so `latest` is always
   current and recovery after a reboot is one command.
 * A keybinding to pop `tmsnap show` into a scratch pane.
-* Tests. The restore path was verified end-to-end against synthetic snapshots,
-  but none of that is automated yet.
+* Exact iTerm split trees and window geometry. That needs iTerm's Python API
+  (`Tab.root`, `Session.frame`, `async_apply_layout`), which would be the first
+  non-stdlib dependency; the AppleScript path deliberately stays optional.
+* Tests. The tmux and iTerm restore paths were verified end-to-end against
+  synthetic snapshots in a scratch window, but none of that is automated yet.
 
 ## License
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-tmsnap -- snapshot and restore tmux sessions, including the Claude Code and
-OpenCode sessions running inside their panes.
+tmsnap -- snapshot and restore a terminal workspace: tmux sessions, the iTerm2
+tabs that hold their clients, and the Claude Code / OpenCode sessions running
+inside their panes.
 
-  tmsnap save [name]            capture the current tmux server
+  tmsnap save [name]            capture the current terminal workspace
   tmsnap list                   list stored snapshots
   tmsnap show [name]            what is in a snapshot (default: latest)
   tmsnap restore [name]         rebuild it (default: latest)
@@ -26,7 +27,14 @@ Design notes
     Everything else is typed into the shell but NOT executed, so you get a
     chance to look at it first.
 
-Nothing in here writes to ~/.claude or the OpenCode database.
+*   iTerm2 tabs are captured through AppleScript and matched to the local tmux
+    server with `tmux list-clients`: the client TTY is the same TTY iTerm gave
+    the tab. That is an exact tab -> tmux session mapping. Restoring with
+    --attach recreates one tab per recorded tmux client, each running
+    `tmux attach -t <session>`, plus any plain iTerm tabs.
+
+Nothing in here writes to ~/.claude, the OpenCode database, or iTerm's saved
+state.
 """
 
 from __future__ import annotations
@@ -75,6 +83,10 @@ def run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def osascript(script: str) -> subprocess.CompletedProcess:
+    return run(["osascript", "-e", script])
+
+
 def tmux(*args: str) -> subprocess.CompletedProcess:
     return run(["tmux", *args])
 
@@ -85,6 +97,10 @@ def have_tmux_server() -> bool:
 
 def now_iso() -> str:
     return datetime.now().astimezone().replace(microsecond=0).isoformat()
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
 def hostname() -> str:
@@ -372,6 +388,316 @@ def agent_for(pane: dict, procs: dict, children: dict) -> dict | None:
 
 
 # --------------------------------------------------------------------------- #
+# iTerm2 tabs
+# --------------------------------------------------------------------------- #
+
+# One record per session, RS-terminated, US-separated. Values are cleaned of
+# the separators so the Python side can parse the output without JSON escaping.
+ITERM_LAYOUT_SCRIPT = """
+on clean(v)
+    try
+        set s to v as text
+    on error
+        return ""
+    end try
+    set AppleScript's text item delimiters to {character id 30, character id 31, linefeed, return}
+    set bits to text items of s
+    set AppleScript's text item delimiters to " "
+    set s to bits as text
+    set AppleScript's text item delimiters to ""
+    return s
+end clean
+
+tell application "iTerm"
+    set us to character id 31
+    set rs to character id 30
+    set out to ""
+    set wi to 0
+    repeat with w in windows
+        set wi to wi + 1
+        set wid to id of w
+        set wname to my clean(name of w)
+        set b to bounds of w
+        set bx to item 1 of b
+        set bty to item 2 of b
+        set br to item 3 of b
+        set bb to item 4 of b
+        set wf to frontmost of w
+        set wh to false
+        try
+            set wh to is hotkey window of w
+        end try
+        set curwinid to ""
+        try
+            set curwinid to my clean(id of current session of w)
+        end try
+        set ti to 0
+        repeat with t in tabs of w
+            set ti to ti + 1
+            set tname to my clean(title of t)
+            set curtabid to ""
+            try
+                set curtabid to my clean(id of current session of t)
+            end try
+            set si to 0
+            repeat with s in sessions of t
+                set si to si + 1
+                set sid to my clean(id of s)
+                set stty to ""
+                try
+                    set stty to my clean(tty of s)
+                end try
+                if stty is not "" then
+                    set tact to (curwinid is not "") and (sid is curwinid)
+                    set sact to (curtabid is not "") and (sid is curtabid)
+                    set sname to my clean(name of s)
+                    set sprof to my clean(profile name of s)
+                    set spath to ""
+                    try
+                        tell s to set spath to my clean(variable named "session.path")
+                    end try
+                    set spid to ""
+                    try
+                        tell s to set spid to my clean(variable named "session.pid")
+                    end try
+                    set scol to ""
+                    try
+                        set scol to my clean(columns of s)
+                    end try
+                    set srow to ""
+                    try
+                        set srow to my clean(rows of s)
+                    end try
+                    set out to out & (wid as text) & us & (wi as text) & us & wname & us & (bx as text) & us & (bty as text) & us & (br as text) & us & (bb as text) & us & (wf as text) & us & (wh as text) & us & (ti as text) & us & tname & us & (tact as text) & us & (si as text) & us & sid & us & stty & us & sname & us & sprof & us & spath & us & spid & us & scol & us & srow & us & (sact as text) & rs
+                end if
+            end repeat
+        end repeat
+    end repeat
+    return out
+end tell
+"""
+
+
+def iterm_running() -> bool:
+    if sys.platform != "darwin" or not shutil.which("osascript"):
+        return False
+    result = osascript('application "iTerm" is running')
+    return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+
+def as_str(value: str) -> str:
+    """Quote a value for an AppleScript string literal."""
+    clean = value.replace("\r", " ").replace("\n", " ").replace("\x1e", " ").replace("\x1f", " ")
+    return '"' + clean.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _int(value: str, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def iterm_version() -> str:
+    result = osascript('tell application "iTerm" to get version')
+    return result.stdout.strip() if result.returncode == 0 else "?"
+
+
+def iterm_layout() -> dict | None:
+    """Read windows, tabs and sessions from iTerm2. None when unavailable."""
+    if not iterm_running():
+        return None
+    result = osascript(ITERM_LAYOUT_SCRIPT)
+    if result.returncode != 0:
+        warn(f"cannot read iTerm tabs: {result.stderr.strip() or 'osascript failed'}")
+        return None
+
+    windows: dict[int, dict] = {}
+    tabs: dict[tuple[int, int], dict] = {}
+    for record in result.stdout.split("\x1e"):
+        record = record.strip("\r\n")
+        if not record:
+            continue
+        f = record.split("\x1f")
+        if len(f) < 22:
+            continue
+        wid, wi = _int(f[0]), _int(f[1])
+        if not wid:
+            continue
+        win = windows.get(wid)
+        if win is None:
+            win = {
+                "id": wid,
+                "index": wi,
+                "name": f[2],
+                "bounds": [_int(f[3]), _int(f[4]), _int(f[5]), _int(f[6])],
+                "frontmost": f[7] == "true",
+                "hotkey": f[8] == "true",
+                "tabs": [],
+            }
+            windows[wid] = win
+        key = (wid, _int(f[9]))
+        tab = tabs.get(key)
+        if tab is None:
+            tab = {
+                "index": _int(f[9]),
+                "title": f[10],
+                "active": f[11] == "true",
+                "sessions": [],
+            }
+            tabs[key] = tab
+            win["tabs"].append(tab)
+        tab["active"] = tab["active"] or f[11] == "true"
+        tab["sessions"].append({
+            "index": _int(f[12]),
+            "id": f[13],
+            "tty": f[14],
+            "name": f[15],
+            "profile": f[16],
+            "cwd": f[17],
+            "pid": _int(f[18]) or None,
+            "columns": _int(f[19]),
+            "rows": _int(f[20]),
+            "active": f[21] == "true",
+        })
+
+    for win in windows.values():
+        win["tabs"] = [t for t in win["tabs"] if t["sessions"]]
+        for tab in win["tabs"]:
+            tab["split"] = infer_split(tab["sessions"])
+    return {
+        "version": iterm_version(),
+        "windows": [w for w in windows.values() if w["tabs"]],
+    }
+
+
+def infer_split(sessions: list[dict]) -> str:
+    """Best-effort split direction from the recorded cell sizes.
+
+    AppleScript does not expose the split tree, only each session's size. Equal
+    rows with different columns means panes sit side by side (a vertical
+    divider); the other way round means they are stacked.
+    """
+    if len(sessions) < 2:
+        return "vertical"
+    cols = {s.get("columns", 0) for s in sessions}
+    rows = {s.get("rows", 0) for s in sessions}
+    if len(rows) == 1 and len(cols) > 1:
+        return "vertical"
+    if len(cols) == 1 and len(rows) > 1:
+        return "horizontal"
+    return "vertical"
+
+
+def tmux_clients() -> dict[str, dict]:
+    """Local tmux clients keyed by their TTY. Exact tab <-> session mapping."""
+    out = tmux("list-clients", "-F", US.join([
+        "#{client_tty}", "#{client_session}", "#{client_control_mode}",
+        "#{client_activity}", "#{client_key_table}",
+    ]))
+    if out.returncode != 0:
+        return {}
+    clients: dict[str, dict] = {}
+    for line in out.stdout.splitlines():
+        f = line.split(US)
+        if len(f) < 3 or not f[0]:
+            continue
+        clients[f[0]] = {
+            "session": f[1],
+            "control": f[2] == "1",
+            "activity": _int(f[3]) if len(f) > 3 else 0,
+            "key_table": f[4] if len(f) > 4 else "",
+        }
+    return clients
+
+
+def tty_processes(tty: str) -> list[dict]:
+    name = tty.removeprefix("/dev/")
+    if not name:
+        return []
+    out = run(["ps", "-t", name, "-o", "pid=,ppid=,pgid=,tpgid=,command="])
+    rows = []
+    for line in out.stdout.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.*)$", line)
+        if not m:
+            continue
+        rows.append({
+            "pid": int(m.group(1)),
+            "ppid": int(m.group(2)),
+            "pgid": int(m.group(3)),
+            "tpgid": int(m.group(4)),
+            "cmd": m.group(5).strip(),
+        })
+    return rows
+
+
+def tty_foreground(tty: str) -> tuple[int | None, str | None]:
+    """Return (shell pid, foreground command basename) for an iTerm TTY."""
+    rows = tty_processes(tty)
+    if not rows:
+        return None, None
+    shell_pid = next((r["pid"] for r in rows if basename(r["cmd"]) in SHELLS), None)
+    tpgid = rows[0]["tpgid"]
+    leader = next((r for r in rows if r["pid"] == tpgid), None)
+    current = basename(leader["cmd"]) if leader else None
+    return shell_pid, current
+
+
+def process_cwd(pid: int) -> str | None:
+    if not pid or not shutil.which("lsof"):
+        return None
+    out = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"]).stdout
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return None
+
+
+def snapshot_iterm() -> dict | None:
+    """Capture iTerm's windows/tabs and bind client tabs to tmux sessions."""
+    layout = iterm_layout()
+    if not layout or not layout["windows"]:
+        return None
+
+    clients = tmux_clients()
+    if any(c.get("control") for c in clients.values()):
+        warn("iTerm is in tmux control mode; its tabs are driven by tmux, so they were not snapshotted")
+        return None
+    layout["mode"] = "clients"
+
+    procs, children = proc_table()
+    for win in layout["windows"]:
+        for tab in win["tabs"]:
+            for sess in tab["sessions"]:
+                binding = clients.get(sess["tty"])
+                if binding:
+                    sess["tmux"] = {"session": binding["session"], "control": binding["control"]}
+                    sess["agent"] = None
+                    sess["command"] = None
+                    continue
+
+                shell_pid, current = tty_foreground(sess["tty"])
+                pid = shell_pid or sess.get("pid")
+                if pid:
+                    sess["pid"] = pid
+                if not sess.get("cwd") and pid:
+                    sess["cwd"] = process_cwd(pid) or ""
+                sess["agent"] = None
+                sess["command"] = None
+                if not pid:
+                    continue
+
+                pseudo = {"pane_pid": pid, "current_command": current or "", "cwd": sess["cwd"]}
+                agent = agent_for(pseudo, procs, children)
+                if agent:
+                    sess["agent"] = agent
+                else:
+                    sess["command"] = foreground_command(pid, procs, children)
+
+    return layout
+
+
+# --------------------------------------------------------------------------- #
 # snapshot
 # --------------------------------------------------------------------------- #
 
@@ -443,7 +769,7 @@ def collect() -> list[dict]:
     return list(sessions.values())
 
 
-def build_snapshot() -> dict:
+def build_snapshot(no_iterm: bool = False) -> dict:
     if not shutil.which("tmux"):
         die("tmux not found in PATH")
     if not have_tmux_server():
@@ -451,13 +777,18 @@ def build_snapshot() -> dict:
     sessions = collect()
     if not sessions:
         die("tmux server has no sessions")
-    return {
+    snapshot = {
         "version": VERSION,
         "created": now_iso(),
         "host": hostname(),
         "tmux_version": tmux("-V").stdout.strip(),
         "sessions": sessions,
     }
+    if not no_iterm:
+        iterm = snapshot_iterm()
+        if iterm:
+            snapshot["iterm"] = iterm
+    return snapshot
 
 
 def snapshot_path(name: str) -> Path:
@@ -491,12 +822,21 @@ def agents_in(snapshot: dict) -> list[tuple[str, dict, dict]]:
     return out
 
 
+def iterm_stats(snapshot: dict) -> tuple[int, int, int]:
+    """(windows, tabs, tmux-client tabs) in a snapshot's iTerm layout."""
+    layout = snapshot.get("iterm") or {}
+    windows = layout.get("windows") or []
+    tabs = [t for w in windows for t in w.get("tabs", [])]
+    clients = sum(1 for t in tabs for s in t.get("sessions", []) if s.get("tmux"))
+    return len(windows), len(tabs), clients
+
+
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
 
 def cmd_save(args: argparse.Namespace) -> int:
-    snapshot = build_snapshot()
+    snapshot = build_snapshot(args.no_iterm)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(snapshot, indent=2) + "\n"
 
@@ -519,6 +859,10 @@ def cmd_save(args: argparse.Namespace) -> int:
     print(f"saved {'+'.join(written)} -> {STATE_DIR}")
     print(f"  {len(snapshot['sessions'])} sessions, {panes} panes, "
           f"{len(agents)} agent sessions ({breakdown})")
+    iw, itabs, iclients = iterm_stats(snapshot)
+    if iw:
+        print(f"  {plural(iw, 'iTerm window')}, {plural(itabs, 'tab')} "
+              f"({plural(iclients, 'tmux client')})")
     weak = [p for _, _, p in agents if p["agent"]["confidence"] not in ("exact", "exact-unverified")]
     if weak:
         print(f"  {len(weak)} binding(s) are heuristic - run 'tmsnap show' for details")
@@ -543,9 +887,27 @@ def cmd_list(_: argparse.Namespace) -> int:
         agents = len(agents_in(snap))
         created = str(snap.get("created", "?"))[:19].replace("T", " ")
         names = ", ".join(s["name"] for s in snap["sessions"])
+        iw, itabs, _ = iterm_stats(snap)
+        itail = f"  {itabs} itabs" if iw else ""
         print(f"{path.stem:<28} {created}  {len(snap['sessions'])} sess  "
-              f"{panes} panes  {agents} agents  [{names}]")
+              f"{panes} panes  {agents} agents{itail}  [{names}]")
     return 0
+
+
+def print_agent(agent: dict, indent: str = "          ") -> None:
+    sid = agent.get("session_id") or "<unidentified>"
+    label = agent.get("name") or agent.get("title") or ""
+    trust = {"exact": "exact", "exact-unverified": "exact (start time not confirmed)",
+             "argv": "from argv", "heuristic": "heuristic",
+             "unknown": "unknown"}.get(agent.get("confidence"), "?")
+    print(f"{indent}{agent['tool']:<9} {label}")
+    print(f"{indent}{sid}")
+    print(f"{indent}binding: {trust}"
+          f"{'  pid ' + str(agent['pid']) if agent.get('pid') else ''}")
+    if agent.get("transcript"):
+        print(f"{indent}transcript: {agent['transcript']}")
+    if agent.get("ambiguity"):
+        print(f"{indent}note: {agent['ambiguity']}")
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -554,7 +916,13 @@ def cmd_show(args: argparse.Namespace) -> int:
           f"host {snap.get('host','?')}  {snap.get('tmux_version','?')}")
 
     agents = agents_in(snap)
-    if not agents:
+    iterm = snap.get("iterm")
+    iterm_agents = [
+        sess for win in (iterm or {}).get("windows", [])
+        for tab in win.get("tabs", []) for sess in tab.get("sessions", [])
+        if sess.get("agent")
+    ]
+    if not agents and not iterm_agents:
         print("  no agent sessions recorded")
 
     for session in snap["sessions"]:
@@ -571,23 +939,37 @@ def cmd_show(args: argparse.Namespace) -> int:
                 print(f"      {cursor} pane {pane['index']}  {pane['cwd']}")
                 agent = pane.get("agent")
                 if agent:
-                    sid = agent.get("session_id") or "<unidentified>"
-                    label = agent.get("name") or agent.get("title") or ""
-                    trust = {"exact": "exact", "exact-unverified": "exact (start time not confirmed)",
-                             "argv": "from argv", "heuristic": "heuristic",
-                             "unknown": "unknown"}.get(agent.get("confidence"), "?")
-                    print(f"          {agent['tool']:<9} {label}")
-                    print(f"          {sid}")
-                    print(f"          binding: {trust}"
-                          f"{'  pid ' + str(agent['pid']) if agent.get('pid') else ''}")
-                    if agent.get("transcript"):
-                        print(f"          transcript: {agent['transcript']}")
-                    if agent.get("ambiguity"):
-                        print(f"          note: {agent['ambiguity']}")
+                    print_agent(agent)
                 elif pane.get("command"):
                     print(f"          command (typed, not run): {pane['command']}")
                 else:
                     print("          empty shell")
+
+    if iterm:
+        iw, itabs, iclients = iterm_stats(snap)
+        print(f"\n  iTerm {iterm.get('version', '?')}   ({plural(iw, 'window')}, "
+              f"{plural(itabs, 'tab')}, {plural(iclients, 'tmux client')})")
+        for window in iterm.get("windows", []):
+            front = " [front]" if window.get("frontmost") else ""
+            print(f"  window {window['index']}{front}"
+                  f"{' [hotkey]' if window.get('hotkey') else ''}")
+            for tab in window.get("tabs", []):
+                mark = " *" if tab.get("active") else "  "
+                print(f"  {mark}tab {tab['index']} \"{tab['title']}\"")
+                for sess in tab.get("sessions", []):
+                    cursor = ">" if sess.get("active") else " "
+                    print(f"      {cursor} session {sess['index']}  "
+                          f"{sess.get('cwd') or '<unknown>'}  "
+                          f"[{sess.get('profile') or 'default'}]")
+                    tmux_session = (sess.get("tmux") or {}).get("session")
+                    if tmux_session:
+                        print(f"          tmux client -> {tmux_session}  (attach on restore)")
+                    elif sess.get("agent"):
+                        print_agent(sess["agent"])
+                    elif sess.get("command"):
+                        print(f"          command (typed, not run): {sess['command']}")
+                    else:
+                        print("          empty shell")
     return 0
 
 
@@ -635,6 +1017,420 @@ def wait_for_shell(target: str, shell: str | None, runner: Runner) -> None:
                 break
         time.sleep(0.05)
     time.sleep(0.15)
+
+
+def iterm_plan(snapshot: dict, restored: set[str], only: bool) -> list[dict] | None:
+    """Plan the iTerm windows/tabs to recreate, minus hotkey windows."""
+    layout = snapshot.get("iterm")
+    if not layout:
+        return None
+    if layout.get("mode") == "control":
+        warn("iTerm was in tmux control mode; use 'tmux -CC attach' instead of tab restore")
+        return None
+    windows = []
+    for win in layout.get("windows", []):
+        if win.get("hotkey"):
+            continue
+        tabs = []
+        for tab in win.get("tabs", []):
+            sessions = tab.get("sessions") or []
+            if not sessions:
+                continue
+            tmux_sessions = {s["tmux"]["session"] for s in sessions if s.get("tmux")}
+            if only and (not tmux_sessions or not (tmux_sessions & restored)):
+                continue
+            tabs.append(tab)
+        if tabs:
+            windows.append({**win, "tabs": tabs})
+    return windows or None
+
+
+def iterm_existing_tabs() -> dict[str, dict]:
+    """tmux session -> existing iTerm tab address, so restore does not duplicate."""
+    layout = iterm_layout()
+    if not layout:
+        return {}
+    clients = tmux_clients()
+    found: dict[str, dict] = {}
+    for win in layout["windows"]:
+        for tab in win["tabs"]:
+            for sess in tab["sessions"]:
+                binding = clients.get(sess["tty"])
+                if binding and not binding.get("control") and binding["session"] not in found:
+                    found[binding["session"]] = {"window": win["id"], "tab": tab["index"]}
+    return found
+
+
+def iterm_current_window_id() -> int | None:
+    result = osascript('tell application "iTerm" to get id of current window')
+    if result.returncode != 0:
+        return None
+    return _int(result.stdout.strip()) or None
+
+
+def _iterm_ref(result: subprocess.CompletedProcess) -> dict | None:
+    if result.returncode != 0:
+        warn(f"iTerm: {result.stderr.strip() or 'AppleScript failed'}")
+        return None
+    f = result.stdout.strip("\r\n").split(US)
+    if len(f) < 5:
+        warn("iTerm: unexpected reply from AppleScript")
+        return None
+    return {"window": _int(f[0]), "tab": _int(f[1]), "session": _int(f[2]),
+            "tty": f[3], "id": f[4]}
+
+
+def iterm_make_window(profile: str, name: str) -> dict | None:
+    script = f"""
+tell application "iTerm"
+    set us to character id 31
+    try
+        set w to create window with profile {as_str(profile)}
+    on error
+        set w to create window with default profile
+    end try
+    set s to current session of w
+    if {as_str(name)} is not "" then
+        try
+            tell s to set name to {as_str(name)}
+        end try
+    end if
+    return (id of w as text) & us & "1" & us & "1" & us & (tty of s) & us & (id of s)
+end tell
+"""
+    return _iterm_ref(osascript(script))
+
+
+# Find the tab/session ordinal of a freshly created session. AppleScript's
+# `sessions of tab` is in tree order, which can differ from creation order after
+# a split, so counting sessions is not reliable. The session GUID is.
+ITERM_FIND_SESSION = """
+set targetid to (id of s as text)
+set tabOrd to 0
+set sessOrd to 0
+set ti to 0
+repeat with tt in tabs of w
+    set ti to ti + 1
+    set si to 0
+    repeat with ss in sessions of tt
+        set si to si + 1
+        if (id of ss as text) is targetid then
+            set tabOrd to ti
+            set sessOrd to si
+        end if
+    end repeat
+end repeat
+"""
+
+
+def iterm_make_tab(wid: int, profile: str, name: str) -> dict | None:
+    script = f"""
+tell application "iTerm"
+    set us to character id 31
+    set w to window id {wid}
+    try
+        tell w
+            set t to create tab with profile {as_str(profile)}
+        end tell
+    on error
+        tell w
+            set t to create tab with default profile
+        end tell
+    end try
+    set s to current session of t
+    if {as_str(name)} is not "" then
+        try
+            tell s to set name to {as_str(name)}
+        end try
+    end if
+    {ITERM_FIND_SESSION}
+    return (id of w as text) & us & (tabOrd as text) & us & (sessOrd as text) & us & (tty of s) & us & (id of s)
+end tell
+"""
+    return _iterm_ref(osascript(script))
+
+
+def iterm_make_split(wid: int, tab: int, profile: str, direction: str, name: str) -> dict | None:
+    how = "vertically" if direction == "vertical" else "horizontally"
+    script = f"""
+tell application "iTerm"
+    set us to character id 31
+    set w to window id {wid}
+    set t to tab {tab} of w
+    set base to session 1 of t
+    try
+        tell base
+            set s to split {how} with profile {as_str(profile)}
+        end tell
+    on error
+        tell base
+            set s to split {how} with default profile
+        end tell
+    end try
+    if {as_str(name)} is not "" then
+        try
+            tell s to set name to {as_str(name)}
+        end try
+    end if
+    {ITERM_FIND_SESSION}
+    return (id of w as text) & us & (tabOrd as text) & us & (sessOrd as text) & us & (tty of s) & us & (id of s)
+end tell
+"""
+    return _iterm_ref(osascript(script))
+
+
+# Locate a session by GUID. The tab/session ordinals move when panes are split,
+# so every write addresses the session by its stable iTerm GUID instead.
+ITERM_FIND_BY_ID = """
+set targetid to {target}
+set foundTab to missing value
+set foundSess to missing value
+set ti to 0
+repeat with tt in tabs of w
+    set ti to ti + 1
+    set si to 0
+    repeat with ss in sessions of tt
+        set si to si + 1
+        if (id of ss as text) is targetid then
+            set foundTab to ti
+            set foundSess to si
+        end if
+    end repeat
+end repeat
+if foundTab is missing value then error "iTerm session is gone"
+"""
+
+
+def _iterm_locate(ref: dict) -> str:
+    if ref.get("id"):
+        return ITERM_FIND_BY_ID.replace("{target}", as_str(ref["id"]))
+    return f"set foundTab to {ref['tab']}\nset foundSess to {ref.get('session') or 1}"
+
+
+def iterm_write(ref: dict, text: str, newline: bool) -> bool:
+    script = f"""
+tell application "iTerm"
+    set w to window id {ref['window']}
+    {_iterm_locate(ref)}
+    set t to tab foundTab of w
+    set s to session foundSess of t
+    tell s to write text {as_str(text)} newline {str(newline).lower()}
+end tell
+"""
+    result = osascript(script)
+    if result.returncode != 0:
+        warn(f"iTerm: cannot type into tab {ref['tab']}: "
+             f"{result.stderr.strip() or 'AppleScript failed'}")
+        return False
+    return True
+
+
+def iterm_select(ref: dict) -> None:
+    body = [
+        'tell application "iTerm"',
+        f"    set w to window id {ref['window']}",
+        f"    {_iterm_locate(ref)}",
+        "    set t to tab foundTab of w",
+        "    select w",
+        "    select t",
+    ]
+    if ref.get("id"):
+        body.append("    select session foundSess of t")
+    body.append("end tell")
+    result = osascript("\n".join(body))
+    if result.returncode != 0:
+        warn(f"iTerm: cannot select tab {ref.get('tab')}: "
+             f"{result.stderr.strip() or 'AppleScript failed'}")
+
+
+def iterm_wait_for_shell(tty: str, timeout: float = 6.0) -> bool:
+    """Wait until the new tab's shell owns the foreground process group.
+
+    Returns False when something else is still in the foreground (an rc file, a
+    login helper, a password prompt). Typing then would feed that program
+    instead of the shell, so the caller must not send anything.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rows = tty_processes(tty)
+        if rows:
+            tpgid = rows[0]["tpgid"]
+            leader = next((r for r in rows if r["pid"] == tpgid), None)
+            if leader and basename(leader["cmd"]) in SHELLS:
+                time.sleep(0.15)
+                return True
+        time.sleep(0.05)
+    return False
+
+
+def iterm_send_payload(ref: dict, sess: dict, tab: dict, no_exec: bool) -> None:
+    label = f'iTerm tab "{tab.get("title") or "?"}"'
+    tmux_session = (sess.get("tmux") or {}).get("session")
+    if tmux_session:
+        line = f"tmux attach -t {shlex.quote(tmux_session)}"
+        if iterm_write(ref, line, not no_exec):
+            if no_exec:
+                print(f"    {label}  typed (not run): {line}")
+            else:
+                print(f"    {label}  attaching: {line}")
+        return
+
+    cwd = sess.get("cwd") or ""
+    cd_sent = False
+    if cwd and os.path.normpath(cwd) != str(Path.home()):
+        target = pane_cwd(cwd)
+        cd_sent = iterm_write(ref, f"cd {shlex.quote(target)}", True)
+        if cd_sent:
+            time.sleep(0.15)
+
+    agent = sess.get("agent")
+    if agent:
+        if agent.get("session_id"):
+            line = resume_command(agent)
+            if iterm_write(ref, line, not no_exec):
+                if no_exec:
+                    print(f"    {label}  resume (press Enter): {line}")
+                else:
+                    print(f"    {label}  resuming: {line}")
+        else:
+            warn(f"{label}: {agent['tool']} is running but no session id was found")
+        return
+
+    command = sess.get("command")
+    if command:
+        if iterm_write(ref, command, False):
+            print(f"    {label}  typed (not run): {command}")
+    elif cd_sent:
+        print(f"    {label}  cd {cwd}")
+    else:
+        print(f"    {label}  empty shell")
+
+
+def _iterm_fill_tab(win_id: int, first: dict, tab: dict) -> list[tuple[dict, dict]]:
+    sessions = tab.get("sessions", [])
+    pairs = [(first, sessions[0])] if sessions else []
+    direction = tab.get("split") or "vertical"
+    for sess in sessions[1:]:
+        ref = iterm_make_split(win_id, first["tab"], sess.get("profile") or "",
+                              direction, sess.get("name") or "")
+        if ref:
+            pairs.append((ref, sess))
+    if len(pairs) < len(sessions):
+        warn(f'iTerm tab "{tab.get("title")}": only {len(pairs)} of {len(sessions)} panes recreated')
+    return pairs
+
+
+def print_iterm_plan(plan: list[dict], no_exec: bool) -> None:
+    print("\n  iTerm tabs (dry run):")
+    for win in plan:
+        print(f"    window {win['index']} \"{win.get('name') or ''}\"")
+        for tab in win["tabs"]:
+            if tab.get("_reuse"):
+                print(f"      tab \"{tab.get('title')}\" (already attached; reuse)")
+                continue
+            print(f"      tab \"{tab.get('title')}\"  profile "
+                  f"{tab['sessions'][0].get('profile') or 'default'}")
+            for sess in tab["sessions"]:
+                tmux_session = (sess.get("tmux") or {}).get("session")
+                if tmux_session:
+                    line = f"tmux attach -t {shlex.quote(tmux_session)}"
+                    print(f"        {'type (not run): ' if no_exec else 'attach: '}{line}")
+                elif sess.get("agent"):
+                    if sess["agent"].get("session_id"):
+                        line = resume_command(sess["agent"])
+                        print(f"        {'type (not run): ' if no_exec else 'resume: '}{line}")
+                    else:
+                        print(f"        {sess['agent']['tool']} (no session id)")
+                elif sess.get("command"):
+                    print(f"        type (not run): {sess['command']}")
+                else:
+                    print("        empty shell")
+
+
+def restore_iterm(snapshot: dict, restored: set[str], args: argparse.Namespace) -> bool:
+    """Recreate the recorded iTerm windows/tabs. True when tabs were handled."""
+    plan = iterm_plan(snapshot, restored, bool(args.only))
+    if not plan:
+        return False
+
+    running = iterm_running()
+    if running:
+        existing = iterm_existing_tabs()
+        for win in plan:
+            for tab in win["tabs"]:
+                tmux_sessions = [s["tmux"]["session"] for s in tab["sessions"] if s.get("tmux")]
+                tab["_reuse"] = next((existing[s] for s in tmux_sessions if s in existing), None)
+    elif not args.dry_run:
+        warn("iTerm is not running - cannot restore its tabs")
+        return False
+
+    if args.dry_run:
+        print_iterm_plan(plan, args.no_exec)
+        return True
+
+    current_wid = iterm_current_window_id()
+    reuse_current = len(plan) == 1 and current_wid is not None
+    addresses: dict[int, dict] = {}
+    created = reused = 0
+
+    for win in plan:
+        pending = [t for t in win["tabs"] if not t.get("_reuse")]
+        reused += len(win["tabs"]) - len(pending)
+        for tab in win["tabs"]:
+            if tab.get("_reuse"):
+                addr = tab["_reuse"]
+                addresses[id(tab)] = {"window": addr["window"], "tab": addr["tab"],
+                                      "session": None, "id": None}
+                print(f'    iTerm tab "{tab.get("title")}" already attached; reusing')
+
+        initial_for: tuple[int, dict] | None = None
+        if reuse_current:
+            win_id = current_wid
+        else:
+            if not pending:
+                continue
+            first = pending[0]
+            ref = iterm_make_window(first["sessions"][0].get("profile") or "",
+                                    first.get("title") or "")
+            if not ref:
+                continue
+            win_id = ref["window"]
+            print(f"\n  iTerm: new window {win_id}")
+            initial_for = (id(first), ref)
+
+        for tab in pending:
+            initial = initial_for[1] if initial_for and id(tab) == initial_for[0] else None
+            if initial is None:
+                ref = iterm_make_tab(win_id, tab["sessions"][0].get("profile") or "",
+                                     tab.get("title") or "")
+                if not ref:
+                    continue
+            else:
+                ref = initial
+            created += 1
+            pairs = _iterm_fill_tab(win_id, ref, tab)
+            active_at = next((i for i, s in enumerate(tab["sessions"]) if s.get("active")), 0)
+            active_ref = pairs[active_at][0] if active_at < len(pairs) else ref
+            addresses[id(tab)] = active_ref
+            for sref, sess in pairs:
+                if not iterm_wait_for_shell(sref["tty"]):
+                    warn(f'iTerm tab "{tab.get("title")}": the shell is not at a '
+                         f"prompt - not typing anything")
+                    continue
+                iterm_send_payload(sref, sess, tab, args.no_exec)
+
+    if not created and not reused:
+        return False
+
+    # Select the recorded active tab of the frontmost window.
+    front = next((w for w in plan if w.get("frontmost")), plan[0])
+    active = next((t for t in front["tabs"] if t.get("active")), front["tabs"][0])
+    if id(active) in addresses:
+        iterm_select(addresses[id(active)])
+    osascript('tell application "iTerm" to activate')
+
+    print(f"\n  iTerm: {created} tab(s) created, {reused} reused")
+    return True
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
@@ -732,7 +1528,14 @@ def cmd_restore(args: argparse.Namespace) -> int:
     if executed:
         print(f"{executed} agent session(s) resumed")
 
-    if args.attach and not args.dry_run and created:
+    # With iTerm available, --attach recreates the recorded tabs. When that is
+    # impossible (no iTerm, no layout, AppleScript refused), fall back to the
+    # old single-session behaviour.
+    iterm_done = False
+    if args.attach and not args.no_iterm:
+        iterm_done = restore_iterm(snap, {s["name"] for s in sessions}, args)
+
+    if args.attach and not iterm_done and not args.dry_run and created:
         name = sessions[0]["name"]
         if os.environ.get("TMUX"):
             runner("switch-client", "-t", name)
@@ -794,13 +1597,16 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(
         prog="tmsnap",
-        description="Snapshot tmux sessions together with the Claude/OpenCode sessions in their panes.",
+        description="Snapshot a terminal workspace: tmux sessions, iTerm2 tabs, "
+                    "and the Claude/OpenCode sessions inside them.",
     )
     parser.add_argument("--version", action="version", version=f"tmsnap {VERSION}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_save = sub.add_parser("save", help="capture the current tmux server")
+    p_save = sub.add_parser("save", help="capture the current terminal workspace")
     p_save.add_argument("name", nargs="?", help="also store under this name")
+    p_save.add_argument("--no-iterm", action="store_true",
+                        help="do not record iTerm2 windows and tabs")
     p_save.set_defaults(func=cmd_save)
 
     p_list = sub.add_parser("list", help="list stored snapshots")
@@ -821,7 +1627,9 @@ def main(argv: list[str] | None = None) -> int:
     p_restore.add_argument("--dry-run", action="store_true",
                            help="print what would happen, change nothing")
     p_restore.add_argument("--attach", action="store_true",
-                           help="attach/switch to the first restored session")
+                           help="recreate iTerm tabs, or attach/switch to the first restored session")
+    p_restore.add_argument("--no-iterm", action="store_true",
+                           help="do not recreate iTerm tabs when using --attach")
     p_restore.set_defaults(func=cmd_restore)
 
     p_prune = sub.add_parser("prune", help="delete old named snapshots")
