@@ -124,9 +124,15 @@ iTerm capture happens automatically when iTerm2 is running. Snapshots taken
 with `--no-iterm`, while iTerm was closed, or by an older `tmsnap` have no
 iTerm section; `--attach` then falls back to the single-session behaviour.
 
-`latest.json` is rewritten on every save. Named snapshots are not touched by a
-later save, so `tmsnap save <name>` is your history and `tmsnap restore` is
-your one-command recovery.
+`latest.json` is rewritten on every save, with one exception, and only on
+macOS: if iTerm2 happens to be unavailable so the new snapshot has no tabs,
+a `latest.json` that does have tabs is left alone and the new snapshot is
+written as `noiterm-<timestamp>.json` instead. Without that, a save taken
+while iTerm2 was closed would quietly make `restore --attach` fall back to a
+single session. An explicit `--no-iterm` is honoured as before, and on Linux
+(no iTerm) nothing changes. Named snapshots are never touched by a later save,
+so `tmsnap save <name>` is your history and `tmsnap restore` is your
+one-command recovery.
 
 ### `restore` flags
 

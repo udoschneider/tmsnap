@@ -831,6 +831,26 @@ def iterm_stats(snapshot: dict) -> tuple[int, int, int]:
     return len(windows), len(tabs), clients
 
 
+def would_lose_tabs(latest: Path, snapshot: dict) -> bool:
+    """True when writing `latest` would drop an iTerm layout it currently has.
+
+    Saving while iTerm2 happens to be closed produces a snapshot with no
+    `iterm` section. Overwriting a tab-bearing latest with it silently breaks
+    `restore --attach`, so such a snapshot is parked under another name.
+    Deliberate `--no-iterm` is not covered: that flag says the caller does not
+    want tab data. No-op on platforms without iTerm (e.g. Linux), where no
+    snapshot ever has tabs.
+    """
+    if sys.platform != "darwin":
+        return False
+    if iterm_stats(snapshot)[1]:
+        return False
+    try:
+        return iterm_stats(json.loads(latest.read_text()))[1] > 0
+    except (OSError, ValueError):
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
@@ -840,8 +860,19 @@ def cmd_save(args: argparse.Namespace) -> int:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(snapshot, indent=2) + "\n"
 
-    write_atomic(STATE_DIR / "latest.json", payload)
-    written = ["latest"]
+    latest = STATE_DIR / "latest.json"
+    written = []
+    if not args.no_iterm and would_lose_tabs(latest, snapshot):
+        # iTerm2 was unavailable, not declined with --no-iterm: keep a
+        # restorable latest instead of replacing it with a tmux-only one.
+        parked = STATE_DIR / f"noiterm-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        write_atomic(parked, payload)
+        written.append(parked.stem)
+        warn(f"left latest.json alone: it has iTerm tabs, this snapshot has none. "
+             f"Saved {parked.stem} instead.")
+    else:
+        write_atomic(latest, payload)
+        written.append("latest")
     if args.name:
         slug = slugify(args.name)
         if slug == "latest":
@@ -860,9 +891,11 @@ def cmd_save(args: argparse.Namespace) -> int:
     print(f"  {len(snapshot['sessions'])} sessions, {panes} panes, "
           f"{len(agents)} agent sessions ({breakdown})")
     iw, itabs, iclients = iterm_stats(snapshot)
-    if iw:
+    if snapshot.get("iterm"):
         print(f"  {plural(iw, 'iTerm window')}, {plural(itabs, 'tab')} "
               f"({plural(iclients, 'tmux client')})")
+    elif sys.platform == "darwin" and not args.no_iterm:
+        print("  0 iTerm tabs (iTerm2 not running)")
     weak = [p for _, _, p in agents if p["agent"]["confidence"] not in ("exact", "exact-unverified")]
     if weak:
         print(f"  {len(weak)} binding(s) are heuristic - run 'tmsnap show' for details")
